@@ -1,14 +1,11 @@
-package main
+package sqlfmt
 
 import (
 	"bytes"
-	"fmt"
-	"io/ioutil"
 	"log"
-	"os"
+	"regexp"
 	"strings"
 	"text/template"
-	"unicode"
 
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/model"
@@ -16,36 +13,26 @@ import (
 )
 
 var (
-	fmap = template.FuncMap{}
+	reList = regexp.MustCompile(`\(((\d+(, ?\d+)*)|('[^']*'(, ?'[^']*')*))\)`)
 )
 
-func init() {
-	fmap["add"] = func(x, y int) int { return x + y }
-	fmap["sqlType"] = func(s string) string {
-		for i, r := range s {
-			if !unicode.IsLetter(r) && r != ' ' {
-				return s[:i]
-			}
-		}
+func fmtType(s string) string {
+	list := reList.FindString(s)
+	if list == "" {
 		return s
 	}
-	fmap["nstr"] = func(s string) string {
-		if s == "" {
-			return "null"
-		}
-		return fmt.Sprintf("%q", s)
+	list = strings.Trim(list, "()")
+	nums := strings.Split(list, ",")
+	for i := 0; i < len(nums); i++ {
+		nums[i] = strings.TrimSpace(nums[i])
 	}
-	fmap["upper"] = strings.ToUpper
+	list = "(" + strings.Join(nums, ", ") + ")"
+	return reList.ReplaceAllString(s, list)
 }
 
-func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	b, err := ioutil.ReadAll(os.Stdin)
-	if err != nil {
-		log.Fatal(err)
-	}
+func Format(sql string) string {
 	parser := parser.New()
-	node, err := parser.ParseOneStmt(string(b), "", "")
+	node, err := parser.ParseOneStmt(sql, "", "")
 	if err != nil {
 		log.Fatal(err)
 	} else if _, ok := node.(*ast.CreateTableStmt); !ok {
@@ -54,24 +41,42 @@ func main() {
 
 	stmt := node.(*ast.CreateTableStmt)
 	table := conv(stmt)
-	tmpl := template.New("root").Funcs(fmap)
-	template.Must(tmpl.New("sql.tmpl").Parse(sqlTemplate))
 
-	buf := new(bytes.Buffer)
-	if err = tmpl.ExecuteTemplate(buf, "sql.tmpl", table); err != nil {
-		log.Fatalf("\n%v\n", err)
+	fmap := template.FuncMap{}
+	fmap["add"] = func(x, y int) int { return x + y }
+	fmap["upper"] = strings.ToUpper
+	fmap["fmtType"] = fmtType
+
+	tmpl := template.New("root").Funcs(fmap)
+	template.Must(tmpl.New("begin").Parse(beginTmpl))
+	template.Must(tmpl.New("col-def").Parse(colDefTmpl))
+	template.Must(tmpl.New("idx-def").Parse(idxDefTmpl))
+	template.Must(tmpl.New("ref-def").Parse(refDefTmpl))
+	template.Must(tmpl.New("end").Parse(endTmpl))
+
+	var (
+		buf    = new(bytes.Buffer)
+		result = make(map[string]string, 5)
+	)
+	for _, name := range []string{
+		"begin", "col-def", "idx-def", "ref-def", "end",
+	} {
+		buf.Reset()
+		if err := tmpl.ExecuteTemplate(buf, name, table); err != nil {
+			log.Fatalf("\n%v\n", err)
+		}
+		result[name] = strings.TrimSpace(buf.String())
 	}
 
-	sql := pretty(buf.String())
-	fmt.Printf("\n%s", sql)
+	return pretty(result)
 }
 
-type Table struct {
+type tableInfo struct {
 	model.TableInfo
 	Schema       model.CIStr
-	Columns      []*Column
-	ForeignKeys  []*ForeignKey
-	Indices      []*Index
+	Columns      []*columnInfo
+	ForeignKeys  []*foreignKeyInfo
+	Indices      []*indexInfo
 	Engine       string
 	AvgRowLength uint64
 	KeyBlockSize uint64
@@ -80,7 +85,7 @@ type Table struct {
 	RowFormat    string
 }
 
-type Column struct {
+type columnInfo struct {
 	model.ColumnInfo
 	NotNull       bool
 	PrimaryKey    bool
@@ -88,23 +93,23 @@ type Column struct {
 	Unique        bool
 }
 
-type ForeignKey struct {
+type foreignKeyInfo struct {
 	model.FKInfo
 	RefSchema model.CIStr
 }
 
-type Index struct {
+type indexInfo struct {
 	model.IndexInfo
 	Fulltext bool
 }
 
-func conv(stmt *ast.CreateTableStmt) *Table {
-	t := new(Table)
+func conv(stmt *ast.CreateTableStmt) *tableInfo {
+	t := new(tableInfo)
 	t.Schema = stmt.Table.Schema
 	t.Name = stmt.Table.Name
 
 	for _, col := range stmt.Cols {
-		ci := new(Column)
+		ci := new(columnInfo)
 		ci.Name = col.Name.Name
 		ci.FieldType = *col.Tp
 		for _, opt := range col.Options {
@@ -136,7 +141,7 @@ func conv(stmt *ast.CreateTableStmt) *Table {
 	// Primary key or unique key as an index
 	for _, col := range t.Columns {
 		if col.PrimaryKey {
-			idx := new(Index)
+			idx := new(indexInfo)
 			// idx.Name.O = "PRIMARY"
 			idx.Primary = true
 			idx.Columns = append(idx.Columns, &model.IndexColumn{
@@ -148,7 +153,7 @@ func conv(stmt *ast.CreateTableStmt) *Table {
 	}
 	for _, col := range t.Columns {
 		if col.Unique {
-			idx := new(Index)
+			idx := new(indexInfo)
 			idx.Unique = true
 			idx.Columns = append(idx.Columns, &model.IndexColumn{
 				Name:   col.Name,
@@ -166,7 +171,7 @@ func conv(stmt *ast.CreateTableStmt) *Table {
 			ast.ConstraintUniq, ast.ConstraintUniqKey, ast.ConstraintUniqIndex,
 			ast.ConstraintFulltext:
 
-			idx := new(Index)
+			idx := new(indexInfo)
 			idx.Name.O = cst.Name
 			idx.Name.L = strings.ToLower(cst.Name)
 			idx.Primary = (cst.Tp == ast.ConstraintPrimaryKey)
@@ -181,7 +186,7 @@ func conv(stmt *ast.CreateTableStmt) *Table {
 			t.Indices = append(t.Indices, idx)
 		case ast.ConstraintForeignKey:
 			ref := cst.Refer
-			fk := new(ForeignKey)
+			fk := new(foreignKeyInfo)
 			fk.Name.O = cst.Name
 			fk.Name.L = strings.ToLower(cst.Name)
 			for _, icol := range cst.Keys {
