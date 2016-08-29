@@ -2,6 +2,7 @@ package sqlfmt
 
 import (
 	"bytes"
+	"fmt"
 	"log"
 	"regexp"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/model"
+	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/parser"
 )
 
@@ -30,22 +32,39 @@ func fmtType(s string) string {
 	return reList.ReplaceAllString(s, list)
 }
 
-func Format(sql string) string {
+func Parse(sql string) *Table {
 	parser := parser.New()
 	node, err := parser.ParseOneStmt(sql, "", "")
 	if err != nil {
 		log.Fatal(err)
-	} else if _, ok := node.(*ast.CreateTableStmt); !ok {
+	}
+	switch stmt := node.(type) {
+	case *ast.CreateTableStmt:
+		table := conv(stmt)
+		table.SQL = sql
+		return table
+	// case *ast.AlterTableType:
+	default:
 		log.Fatal("unsupported SQL statement")
 	}
+	return nil
+}
 
-	stmt := node.(*ast.CreateTableStmt)
-	table := conv(stmt)
+func Format(sql string) string {
+	table := Parse(sql)
 
 	fmap := template.FuncMap{}
 	fmap["add"] = func(x, y int) int { return x + y }
 	fmap["upper"] = strings.ToUpper
 	fmap["fmtType"] = fmtType
+	fmap["nullable"] = func(notNull *bool) string {
+		if notNull == nil {
+			return ""
+		} else if *notNull {
+			return "NOT NULL"
+		}
+		return "NULL"
+	}
 
 	tmpl := template.New("root").Funcs(fmap)
 	template.Must(tmpl.New("begin").Parse(beginTmpl))
@@ -71,45 +90,55 @@ func Format(sql string) string {
 	return pretty(result)
 }
 
-type tableInfo struct {
+type Table struct {
 	model.TableInfo
 	Schema       model.CIStr
-	Columns      []*columnInfo
-	ForeignKeys  []*foreignKeyInfo
-	Indices      []*indexInfo
+	Columns      []*Column
+	ForeignKeys  []*ForeignKey
+	Indices      []*Index
 	Engine       string
 	AvgRowLength uint64
 	KeyBlockSize uint64
 	MinRows      uint64
 	MaxRows      uint64
 	RowFormat    string
+	SQL          string
 }
 
-type columnInfo struct {
+type Column struct {
 	model.ColumnInfo
-	NotNull       bool
+	Ordinal       int
+	NotNull       *bool
 	PrimaryKey    bool
 	AutoIncrement bool
 	Unique        bool
+	Attribute     string
+	DefaultValue  string
+	OnUpdate      string
 }
 
-type foreignKeyInfo struct {
+type ForeignKey struct {
 	model.FKInfo
 	RefSchema model.CIStr
+	OnUpdate  string
+	OnDelete  string
 }
 
-type indexInfo struct {
+type Index struct {
 	model.IndexInfo
 	Fulltext bool
 }
 
-func conv(stmt *ast.CreateTableStmt) *tableInfo {
-	t := new(tableInfo)
+type AlterTable struct {
+}
+
+func conv(stmt *ast.CreateTableStmt) *Table {
+	t := new(Table)
 	t.Schema = stmt.Table.Schema
 	t.Name = stmt.Table.Name
 
 	for _, col := range stmt.Cols {
-		ci := new(columnInfo)
+		ci := new(Column)
 		ci.Name = col.Name.Name
 		ci.FieldType = *col.Tp
 		for _, opt := range col.Options {
@@ -118,30 +147,56 @@ func conv(stmt *ast.CreateTableStmt) *tableInfo {
 			case ast.ColumnOptionPrimaryKey:
 				ci.PrimaryKey = true
 			case ast.ColumnOptionNotNull:
-				ci.NotNull = true
+				ci.NotNull = new(bool)
+				*ci.NotNull = true
 			case ast.ColumnOptionAutoIncrement:
 				ci.AutoIncrement = true
 			case ast.ColumnOptionDefaultValue:
-				ci.DefaultValue = opt.Expr.GetValue()
+				// log.Printf("DefaultValue: %v\n", opt.Expr.GetValue())
+				if v := opt.Expr.GetValue(); v != nil {
+					ci.DefaultValue = fmt.Sprintf("%v", v)
+				} else if expr, ok := opt.Expr.(*ast.FuncCallExpr); ok {
+					ci.DefaultValue = expr.FnName.O
+				}
+			case ast.ColumnOptionOnUpdate: // For Timestamp and Datetime only.
+				if v := opt.Expr.GetValue(); v != nil {
+					ci.OnUpdate = fmt.Sprintf("%v", v)
+				} else if expr, ok := opt.Expr.(*ast.FuncCallExpr); ok {
+					ci.OnUpdate = expr.FnName.O
+				}
 			case ast.ColumnOptionUniq, ast.ColumnOptionUniqIndex, ast.ColumnOptionUniqKey:
 				ci.Unique = true
 			case ast.ColumnOptionIndex:
 			case ast.ColumnOptionKey:
 			case ast.ColumnOptionNull:
-			case ast.ColumnOptionOnUpdate: // For Timestamp and Datetime only.
+				ci.NotNull = new(bool)
+				*ci.NotNull = false
 			case ast.ColumnOptionFulltext:
 				//
 			case ast.ColumnOptionComment:
 				ci.Comment = opt.Expr.Text()
 			}
 		}
+
+		var attrs []string
+		if mysql.HasUnsignedFlag(col.Tp.Flag) {
+			attrs = append(attrs, "UNSIGNED")
+		}
+		if mysql.HasZerofillFlag(col.Tp.Flag) {
+			attrs = append(attrs, "ZEROFILL")
+		}
+		if mysql.HasBinaryFlag(col.Tp.Flag) {
+			attrs = append(attrs, "BINARY")
+		}
+		ci.Attribute = strings.Join(attrs, " ")
+
 		t.Columns = append(t.Columns, ci)
 	}
 
 	// Primary key or unique key as an index
 	for _, col := range t.Columns {
 		if col.PrimaryKey {
-			idx := new(indexInfo)
+			idx := new(Index)
 			// idx.Name.O = "PRIMARY"
 			idx.Primary = true
 			idx.Columns = append(idx.Columns, &model.IndexColumn{
@@ -153,7 +208,7 @@ func conv(stmt *ast.CreateTableStmt) *tableInfo {
 	}
 	for _, col := range t.Columns {
 		if col.Unique {
-			idx := new(indexInfo)
+			idx := new(Index)
 			idx.Unique = true
 			idx.Columns = append(idx.Columns, &model.IndexColumn{
 				Name:   col.Name,
@@ -171,7 +226,7 @@ func conv(stmt *ast.CreateTableStmt) *tableInfo {
 			ast.ConstraintUniq, ast.ConstraintUniqKey, ast.ConstraintUniqIndex,
 			ast.ConstraintFulltext:
 
-			idx := new(indexInfo)
+			idx := new(Index)
 			idx.Name.O = cst.Name
 			idx.Name.L = strings.ToLower(cst.Name)
 			idx.Primary = (cst.Tp == ast.ConstraintPrimaryKey)
@@ -186,7 +241,7 @@ func conv(stmt *ast.CreateTableStmt) *tableInfo {
 			t.Indices = append(t.Indices, idx)
 		case ast.ConstraintForeignKey:
 			ref := cst.Refer
-			fk := new(foreignKeyInfo)
+			fk := new(ForeignKey)
 			fk.Name.O = cst.Name
 			fk.Name.L = strings.ToLower(cst.Name)
 			for _, icol := range cst.Keys {
@@ -197,8 +252,50 @@ func conv(stmt *ast.CreateTableStmt) *tableInfo {
 			for _, icol := range ref.IndexColNames {
 				fk.RefCols = append(fk.RefCols, icol.Column.Name)
 			}
+			if ref.OnUpdate != nil {
+				switch ref.OnUpdate.ReferOpt {
+				case ast.ReferOptionNoAction:
+					fk.OnUpdate = "NO ACTION"
+				case ast.ReferOptionSetNull:
+					fk.OnUpdate = "SET NULL"
+				case ast.ReferOptionRestrict:
+					fk.OnUpdate = "RESTRICT"
+				case ast.ReferOptionCascade:
+					fk.OnUpdate = "CASCADE"
+				}
+			}
+			if ref.OnDelete != nil {
+				switch ref.OnDelete.ReferOpt {
+				case ast.ReferOptionNoAction:
+					fk.OnDelete = "NO ACTION"
+				case ast.ReferOptionSetNull:
+					fk.OnDelete = "SET NULL"
+				case ast.ReferOptionRestrict:
+					fk.OnDelete = "RESTRICT"
+				case ast.ReferOptionCascade:
+					fk.OnDelete = "CASCADE"
+				}
+			}
 			t.ForeignKeys = append(t.ForeignKeys, fk)
 		}
+	}
+
+	// Mark column(s) in the primary key
+	for _, idx := range t.Indices {
+		if !idx.Primary {
+			continue
+		}
+		for _, icol := range idx.Columns {
+			for _, col := range t.Columns {
+				if icol.Name.String() == col.Name.String() {
+					col.PrimaryKey = true
+				}
+			}
+		}
+	}
+
+	for i := range t.Columns {
+		t.Columns[i].Ordinal = i + 1
 	}
 
 	for _, opt := range stmt.Options {
@@ -228,7 +325,20 @@ func conv(stmt *ast.CreateTableStmt) *tableInfo {
 			t.MinRows = opt.UintValue
 		case ast.TableOptionDelayKeyWrite:
 		case ast.TableOptionRowFormat:
-			t.RowFormat = opt.StrValue
+			switch opt.UintValue {
+			case ast.RowFormatDefault:
+				t.RowFormat = "DEFAULT"
+			case ast.RowFormatDynamic:
+				t.RowFormat = "DYNAMIC"
+			case ast.RowFormatFixed:
+				t.RowFormat = "FIXED"
+			case ast.RowFormatCompressed:
+				t.RowFormat = "COMPRESSED"
+			case ast.RowFormatRedundant:
+				t.RowFormat = "REDUNDANT"
+			case ast.RowFormatCompact:
+				t.RowFormat = "COMPACT"
+			}
 		case ast.TableOptionStatsPersistent:
 		}
 	}
